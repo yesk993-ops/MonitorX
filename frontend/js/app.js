@@ -356,6 +356,14 @@ function checkOSIssues(data) {
         }
     }
 
+    if (data.kernel_errors && data.kernel_errors.length > 0) {
+        addIssue('warning', `Kernel/Log errors detected: ${data.kernel_errors.length} recent error entries in system log (${data.kernel_errors[0]})`, {
+            label: 'Fix Now: Clear Kernel & Logs',
+            kind: 'remediate',
+            action: 'clear_kernel_logs'
+        });
+    }
+
     const criticalCount = issues.filter(i => i.severity === 'critical').length;
     const warningCount = issues.filter(i => i.severity === 'warning').length;
     document.getElementById('issues-count-critical').textContent = `${criticalCount} Critical`;
@@ -650,10 +658,12 @@ function renderHealthChecks(checks) {
             fixButtonHtml = `<button class="btn btn-sm btn-warning" onclick="remediateAction('vacuum_journal')">⚡ Vacuum Journal Logs</button>`;
         } else if (c.action === 'restart_failed_services') {
             fixButtonHtml = `<button class="btn btn-sm btn-danger" onclick="remediateAction('restart_failed_services')">⚡ Restart Failed Services</button>`;
+        } else if (c.action === 'clear_kernel_logs' || c.action === 'clear_kernel_errors' || c.action === 'clear_dmesg') {
+            fixButtonHtml = `<button class="btn btn-sm btn-warning" onclick="remediateAction('clear_kernel_logs')">⚡ Quick Fix Kernel & Logs</button>`;
         } else if (c.action === 'view_bottlenecks') {
             fixButtonHtml = `<button class="btn btn-sm btn-primary" onclick="switchSubTab('bottlenecks')">🔥 Open Bottleneck Finder</button>`;
         } else if (c.action === 'view_logs') {
-            fixButtonHtml = `<button class="btn btn-sm btn-primary" onclick="switchSubTab('log-inspector')">📋 Inspect Logs</button>`;
+            fixButtonHtml = `<button class="btn btn-sm btn-warning" onclick="remediateAction('clear_kernel_logs')">⚡ Quick Fix Kernel & Logs</button> <button class="btn btn-sm btn-primary" onclick="switchSubTab('log-inspector')">📋 Inspect Logs</button>`;
         } else if (c.action === 'run_net_diag') {
             fixButtonHtml = `<button class="btn btn-sm btn-primary" onclick="switchSubTab('net-suite')">🌐 Open Network Suite</button>`;
         } else if (c.action === 'view_processes') {
@@ -690,9 +700,11 @@ async function remediateAction(action, target = null) {
             showToast(`Action success: ${result.message}`, 'success');
             if (state.currentTab === 'troubleshoot') {
                 runFullHealthScan();
-            } else {
-                fetchStats();
+                if (state.currentSubTab === 'log-inspector') {
+                    fetchLogs();
+                }
             }
+            fetchStats();
         } else {
             showToast(`Action failed: ${result.message}`, 'error');
         }

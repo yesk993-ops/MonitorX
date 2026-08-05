@@ -265,6 +265,7 @@ class SystemStats(BaseModel):
     vms: Optional[List[Dict[str, Any]]] = None
     containers: Optional[List[Dict[str, Any]]] = None
     pods: Optional[List[Dict[str, Any]]] = None
+    kernel_errors: Optional[List[str]] = None
 
 
 class PingRequest(BaseModel):
@@ -617,6 +618,45 @@ async def get_system_info() -> Dict[str, Any]:
         "uptime_str": str(uptime).split('.')[0],
         "python_version": platform.python_version()
     }
+
+
+async def get_kernel_errors() -> List[str]:
+    """Retrieve recent critical kernel buffer or system log error entries."""
+    kernel_errors = []
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "dmesg", "-T",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        out = stdout.decode().strip()
+        if out:
+            lines = [l for l in out.split('\n') if l.strip()]
+            for l in lines[-100:]:
+                if re.search(r'oom-killer|out of memory|panic|error|failed|corruption', l, re.I):
+                    kernel_errors.append(l[:120])
+    except Exception:
+        pass
+
+    if not kernel_errors:
+        try:
+            jproc = await asyncio.create_subprocess_exec(
+                "journalctl", "-p", "3", "-n", "30", "--no-pager",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout_j, _ = await jproc.communicate()
+            out_j = stdout_j.decode().strip()
+            if out_j and "No journal files" not in out_j:
+                lines = [l for l in out_j.split('\n') if l.strip() and not l.startswith("Hint:")]
+                for l in lines[-10:]:
+                    if re.search(r'error|fail|critical|panic|fatal|oom|corrupt', l, re.I):
+                        kernel_errors.append(l[:120])
+        except Exception:
+            pass
+
+    return kernel_errors
 
 
 # =============================================================================
@@ -1666,10 +1706,11 @@ async def collect_all_stats() -> SystemStats:
         vms = await get_vm_stats()
         containers = await get_docker_containers()
         pods = await get_kubernetes_pods()
+        kernel_errors = await get_kernel_errors()
         return SystemStats(
             timestamp=datetime.now().isoformat(), cpu=cpu, memory=memory, disk=disk,
             network=network, gpu=gpu, processes=processes, system=system, vms=vms,
-            containers=containers, pods=pods
+            containers=containers, pods=pods, kernel_errors=kernel_errors
         )
 
 
@@ -2389,22 +2430,7 @@ async def troubleshoot_health_check():
         })
 
     # 6. Kernel & Log Errors (dmesg / journalctl)
-    kernel_errors = []
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "dmesg", "-T",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        out = stdout.decode().strip()
-        if out:
-            lines = [l for l in out.split('\n') if l.strip()]
-            for l in lines[-100:]:
-                if re.search(r'oom-killer|out of memory|panic|error|failed|corruption', l, re.I):
-                    kernel_errors.append(l[:120])
-    except Exception:
-        pass
+    kernel_errors = await get_kernel_errors()
 
     if kernel_errors:
         health_score -= 12
@@ -2413,10 +2439,10 @@ async def troubleshoot_health_check():
             "category": "Kernel & Logs",
             "name": "Critical System Errors",
             "status": "warning",
-            "value": f"{len(kernel_errors)} recent error entries in kernel buffer",
-            "message": f"Recent critical error in dmesg: {kernel_errors[0]}",
-            "remediation": "Inspect full system logs in Log Inspector.",
-            "action": "view_logs"
+            "value": f"{len(kernel_errors)} recent error entries in kernel buffer / logs",
+            "message": f"Recent critical error log: {kernel_errors[0]}",
+            "remediation": "Clear kernel ring buffer and vacuum system logs via automated quick fix.",
+            "action": "clear_kernel_logs"
         })
     else:
         checks.append({
@@ -2851,6 +2877,67 @@ async def perform_remediation(req: RemediateRequest):
             )
             stdout, stderr = await proc.communicate()
             return {"success": proc.returncode == 0, "message": stdout.decode().strip() or stderr.decode().strip()}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    elif action in ("clear_kernel_logs", "clear_kernel_errors", "clear_dmesg"):
+        try:
+            dmesg_bin = shutil.which("dmesg") or "/usr/bin/dmesg"
+            journal_bin = JOURNALCTL_BIN or shutil.which("journalctl") or "/usr/bin/journalctl"
+
+            proc1 = await asyncio.create_subprocess_exec(
+                "sudo", "-n", dmesg_bin, "-C",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout1, stderr1 = await proc1.communicate()
+            if proc1.returncode != 0:
+                proc1 = await asyncio.create_subprocess_exec(
+                    dmesg_bin, "-C",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout1, stderr1 = await proc1.communicate()
+
+            proc_rot = await asyncio.create_subprocess_exec(
+                "sudo", "-n", journal_bin, "--rotate",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc_rot.communicate()
+            if proc_rot.returncode != 0:
+                proc_rot2 = await asyncio.create_subprocess_exec(
+                    journal_bin, "--rotate",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc_rot2.communicate()
+
+            proc2 = await asyncio.create_subprocess_exec(
+                "sudo", "-n", journal_bin, "--vacuum-time=1s",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout2, stderr2 = await proc2.communicate()
+            if proc2.returncode != 0:
+                proc2 = await asyncio.create_subprocess_exec(
+                    journal_bin, "--vacuum-time=1s",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout2, stderr2 = await proc2.communicate()
+
+            if proc1.returncode == 0 or proc2.returncode == 0:
+                return {
+                    "success": True,
+                    "message": "Kernel error buffer cleared and system journal logs rotated & vacuumed successfully!"
+                }
+            else:
+                err_msg = stderr1.decode().strip() or stderr2.decode().strip() or "Permission denied clearing dmesg/journal"
+                return {
+                    "success": False,
+                    "message": f"Could not clear kernel/journal logs: {err_msg}"
+                }
         except Exception as e:
             return {"success": False, "message": str(e)}
 

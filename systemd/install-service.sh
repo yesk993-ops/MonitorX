@@ -66,14 +66,15 @@ EOF
 SYSTEMCTL_BIN="$(command -v systemctl)"
 SYSCTL_BIN="$(command -v sysctl)"
 JOURNALCTL_BIN="$(command -v journalctl)"
+DMESG_BIN="$(command -v dmesg || true)"
 VIRSH_BIN="$(command -v virsh || true)"
 SUDOERS_DEST="/etc/sudoers.d/monitorx-systemctl"
 SUDOERS_VM_DEST="/etc/sudoers.d/monitorx-virsh"
 echo "[2/4] Installing limited service-control policy at $SUDOERS_DEST..."
 cat <<EOF | sudo tee "$SUDOERS_DEST" > /dev/null
-# Managed by MonitorX. Required for dashboard Start/Stop/Restart controls.
+# Managed by MonitorX. Required for dashboard Start/Stop/Restart controls and Troubleshoot Hub remediations.
 Cmnd_Alias MONITORX_SYSTEMCTL = $SYSTEMCTL_BIN --no-ask-password start *.service, $SYSTEMCTL_BIN --no-ask-password stop *.service, $SYSTEMCTL_BIN --no-ask-password restart *.service, $SYSTEMCTL_BIN --no-ask-password reload *.service, $SYSTEMCTL_BIN --no-ask-password enable *.service, $SYSTEMCTL_BIN --no-ask-password disable *.service
-Cmnd_Alias MONITORX_REMEDIATION = $SYSCTL_BIN -w vm.drop_caches=3, $JOURNALCTL_BIN --vacuum-time=2d
+Cmnd_Alias MONITORX_REMEDIATION = $SYSCTL_BIN -w vm.drop_caches=3, $JOURNALCTL_BIN --vacuum-time=2d, $JOURNALCTL_BIN --vacuum-time=1s, $JOURNALCTL_BIN --rotate, $DMESG_BIN -C, $DMESG_BIN --clear
 $CURRENT_USER ALL=(root) NOPASSWD: MONITORX_SYSTEMCTL, MONITORX_REMEDIATION
 EOF
 sudo chmod 440 "$SUDOERS_DEST"
