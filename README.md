@@ -124,3 +124,8 @@ MonitorX/
    - Let operators create threshold rules with cooldowns, acknowledgement, silencing, and notification routing directly from the dashboard.
 8. **Fleet view**:
    - Securely aggregate multiple MonitorX agents into a host inventory with tags, health rollups, and drill-down diagnostics.
+
+## Added Improvements
+- Diagnostic Timeline & root-cause hints added to troubleshoot mode.
+- 1-click remediation (clear pagecache, restart failed services, vacuum journal, kill process) enabled.
+- VM features expanded: live vCPU/thread metrics, bulk start/stop, snapshot/restore actions, VM log tail, resize UI.
