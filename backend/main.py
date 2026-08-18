@@ -64,6 +64,23 @@ last_disk_time = None
 vm_metric_samples: dict[str, dict[str, float]] = {}
 vm_metrics_lock = asyncio.Lock()
 
+# Cache for static/slow-changing system info (refreshed every 60s)
+_system_info_cache = None
+_system_info_cache_time = 0.0
+SYSTEM_INFO_CACHE_TTL = 60.0
+
+# Thread pool executor for blocking I/O operations
+_executor = None
+
+def _get_executor():
+    """Get or create the thread executor for blocking operations."""
+    global _executor
+    if _executor is None:
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="psutil"
+        )
+    return _executor
+
 # Initialize NVML if available
 if NVML_AVAILABLE:
     try:
@@ -237,10 +254,13 @@ async def lifespan(app: FastAPI):
                 _conn.close()
             except Exception:
                 pass
-    global _libvirt_executor
+    global _libvirt_executor, _executor
     if _libvirt_executor:
         _libvirt_executor.shutdown(wait=False)
         _libvirt_executor = None
+    if _executor:
+        _executor.shutdown(wait=False)
+        _executor = None
     logger.info("Monitoring Dashboard stopped")
 
 
@@ -373,31 +393,48 @@ manager = ConnectionManager()
 
 async def get_cpu_stats() -> dict[str, Any]:
     """Get CPU statistics without blocking interval"""
-    cpu_percent = psutil.cpu_percent(interval=None, percpu=True)
-    cpu_freq = psutil.cpu_freq()
-    cpu_count = psutil.cpu_count(logical=True)
-    cpu_count_physical = psutil.cpu_count(logical=False)
+    loop = asyncio.get_running_loop()
+    
+    # Run blocking psutil calls in thread pool
+    cpu_data = await loop.run_in_executor(_get_executor(), lambda: {
+        'cpu_percent': psutil.cpu_percent(interval=None, percpu=True),
+        'cpu_freq': psutil.cpu_freq(),
+        'cpu_count_logical': psutil.cpu_count(logical=True),
+        'cpu_count_physical': psutil.cpu_count(logical=False),
+        'cpu_times': psutil.cpu_times()._asdict() if psutil.cpu_times() else {}
+    })
+    
     load_avg = os.getloadavg() if hasattr(os, 'getloadavg') else (0, 0, 0)
+    cpu_percent = cpu_data['cpu_percent']
+    cpu_freq = cpu_data['cpu_freq']
     
     return {
         "percent_per_core": cpu_percent,
         "percent_total": sum(cpu_percent) / len(cpu_percent) if cpu_percent else 0,
-        "count_logical": cpu_count or 1,
-        "count_physical": cpu_count_physical or 1,
+        "count_logical": cpu_data['cpu_count_logical'] or 1,
+        "count_physical": cpu_data['cpu_count_physical'] or 1,
         "frequency_current": cpu_freq.current if cpu_freq else 0,
         "frequency_min": cpu_freq.min if cpu_freq else 0,
         "frequency_max": cpu_freq.max if cpu_freq else 0,
         "load_1min": load_avg[0],
         "load_5min": load_avg[1],
         "load_15min": load_avg[2],
-        "times": dict(psutil.cpu_times()._asdict()) if psutil.cpu_times() else {}
+        "times": cpu_data['cpu_times']
     }
 
 
 async def get_memory_stats() -> dict[str, Any]:
     """Get memory statistics"""
-    vm = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    loop = asyncio.get_running_loop()
+    
+    # Run blocking psutil calls in thread pool
+    mem_data = await loop.run_in_executor(_get_executor(), lambda: {
+        'vm': psutil.virtual_memory(),
+        'swap': psutil.swap_memory()
+    })
+    
+    vm = mem_data['vm']
+    swap = mem_data['swap']
     
     return {
         "total": vm.total,
@@ -418,7 +455,15 @@ async def get_disk_stats() -> dict[str, Any]:
     """Get disk statistics and transfer rate"""
     global last_disk_io, last_disk_time
     
-    partitions = psutil.disk_partitions()
+    loop = asyncio.get_running_loop()
+    
+    # Run blocking psutil calls in thread pool
+    disk_data = await loop.run_in_executor(_get_executor(), lambda: {
+        'partitions': psutil.disk_partitions(),
+        'disk_io': psutil.disk_io_counters()
+    })
+    
+    partitions = disk_data['partitions']
     disks = []
     
     for partition in partitions:
@@ -446,7 +491,7 @@ async def get_disk_stats() -> dict[str, Any]:
             continue
     
     now = time.time()
-    disk_io = psutil.disk_io_counters()
+    disk_io = disk_data['disk_io']
     
     read_bytes_sec = 0.0
     write_bytes_sec = 0.0
@@ -474,8 +519,21 @@ async def get_network_stats() -> dict[str, Any]:
     """Get network statistics and transfer rates"""
     global last_net_io, last_net_time
     
+    loop = asyncio.get_running_loop()
+    
+    # Run blocking psutil calls in thread pool
+    net_data = await loop.run_in_executor(_get_executor(), lambda: {
+        'net_io': psutil.net_io_counters(pernic=True),
+        'connections_count': 0
+    })
+    
+    try:
+        net_data['connections_count'] = len(psutil.net_connections(kind='inet'))
+    except Exception:
+        pass
+    
     now = time.time()
-    net_io = psutil.net_io_counters(pernic=True)
+    net_io = net_data['net_io']
     interfaces = {}
     
     rx_bytes_sec = 0.0
@@ -504,16 +562,10 @@ async def get_network_stats() -> dict[str, Any]:
             "dropin": stats.dropin,
             "dropout": stats.dropout
         }
-    
-    connections_count = 0
-    try:
-        connections_count = len(psutil.net_connections(kind='inet'))
-    except Exception:
-        pass
 
     return {
         "interfaces": interfaces,
-        "connections_count": connections_count,
+        "connections_count": net_data['connections_count'],
         "rx_bytes_sec": round(rx_bytes_sec, 1),
         "tx_bytes_sec": round(tx_bytes_sec, 1)
     }
@@ -583,35 +635,60 @@ async def get_gpu_stats() -> list[dict[str, Any]] | None:
 
 async def get_process_stats(limit: int = 30) -> list[dict[str, Any]]:
     """Get processes sorted by resource usage"""
-    processes = []
+    loop = asyncio.get_running_loop()
     
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'memory_info', 'status', 'username', 'create_time', 'num_threads']):
-        try:
-            info = proc.info
-            processes.append({
-                "pid": info['pid'],
-                "name": info['name'][:50] if info['name'] else "unknown",
-                "cpu_percent": round(info['cpu_percent'] or 0.0, 1),
-                "memory_percent": round(info['memory_percent'] or 0.0, 1),
-                "memory_mb": round((info['memory_info'].rss / 1024 / 1024) if info['memory_info'] else 0.0, 1),
-                "status": info['status'] or "unknown",
-                "username": info['username'] or "unknown",
-                "threads": info['num_threads'] or 1,
-                "create_time": datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M:%S') if info['create_time'] else "unknown"
-            })
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+    # Run blocking psutil.process_iter in thread pool
+    def _get_processes():
+        procs = []
+        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'memory_info', 'status', 'username', 'create_time', 'num_threads']):
+            try:
+                info = proc.info
+                procs.append({
+                    "pid": info['pid'],
+                    "name": info['name'][:50] if info['name'] else "unknown",
+                    "cpu_percent": round(info['cpu_percent'] or 0.0, 1),
+                    "memory_percent": round(info['memory_percent'] or 0.0, 1),
+                    "memory_mb": round((info['memory_info'].rss / 1024 / 1024) if info['memory_info'] else 0.0, 1),
+                    "status": info['status'] or "unknown",
+                    "username": info['username'] or "unknown",
+                    "threads": info['num_threads'] or 1,
+                    "create_time": info['create_time']
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return procs
+    
+    processes = await loop.run_in_executor(_get_executor(), _get_processes)
+    
+    # Format create_time in main thread (no I/O needed)
+    now = datetime.now()
+    for proc in processes:
+        if proc["create_time"]:
+            proc["create_time"] = datetime.fromtimestamp(proc["create_time"]).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            proc["create_time"] = "unknown"
     
     processes.sort(key=lambda x: x['cpu_percent'], reverse=True)
     return processes[:limit]
 
 
 async def get_system_info() -> dict[str, Any]:
-    """Get system information"""
-    boot_time = datetime.fromtimestamp(psutil.boot_time())
+    """Get system information (cached for 60s to avoid repeated syscalls)"""
+    global _system_info_cache, _system_info_cache_time
+    
+    now = time.time()
+    if _system_info_cache and (now - _system_info_cache_time) < SYSTEM_INFO_CACHE_TTL:
+        return _system_info_cache
+    
+    loop = asyncio.get_running_loop()
+    
+    # Run blocking psutil call in thread pool
+    boot_time_ts = await loop.run_in_executor(_get_executor(), psutil.boot_time)
+    
+    boot_time = datetime.fromtimestamp(boot_time_ts)
     uptime = datetime.now() - boot_time
     
-    return {
+    _system_info_cache = {
         "hostname": socket.gethostname(),
         "platform": platform.system(),
         "platform_release": platform.release(),
@@ -623,6 +700,9 @@ async def get_system_info() -> dict[str, Any]:
         "uptime_str": str(uptime).split('.')[0],
         "python_version": platform.python_version()
     }
+    _system_info_cache_time = now
+    
+    return _system_info_cache
 
 
 # =============================================================================
