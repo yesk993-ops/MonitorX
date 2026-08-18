@@ -9,23 +9,29 @@ import logging
 import os
 import platform
 import re
+import shutil
 import socket
 import sqlite3
-import shutil
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+import psutil
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
-import psutil
 
 # Optional imports for GPU monitoring
 try:
@@ -55,7 +61,7 @@ last_disk_time = None
 
 # Libvirt counters are cumulative. Keep one prior sample per domain to calculate
 # instantaneous CPU, disk, and network rates.
-vm_metric_samples: Dict[str, Dict[str, float]] = {}
+vm_metric_samples: dict[str, dict[str, float]] = {}
 vm_metrics_lock = asyncio.Lock()
 
 # Initialize NVML if available
@@ -92,7 +98,7 @@ libvirt_rw_conn = None   # read-write connection (lifecycle control)
 # Serialize (re)connect attempts so a burst of requests cannot open a storm of
 # sockets against a libvirtd that is still starting up.
 _libvirt_connect_lock = asyncio.Lock()
-_libvirt_last_error: Optional[str] = None
+_libvirt_last_error: str | None = None
 
 # Thread executor for blocking libvirt operations
 _libvirt_executor = None
@@ -255,16 +261,16 @@ templates = Jinja2Templates(directory=str(FRONTEND_DIR))
 # Pydantic models
 class SystemStats(BaseModel):
     timestamp: str
-    cpu: Dict[str, Any]
-    memory: Dict[str, Any]
-    disk: Dict[str, Any]
-    network: Dict[str, Any]
-    gpu: Optional[List[Dict[str, Any]]] = None
-    processes: List[Dict[str, Any]]
-    system: Dict[str, Any]
-    vms: Optional[List[Dict[str, Any]]] = None
-    containers: Optional[List[Dict[str, Any]]] = None
-    pods: Optional[List[Dict[str, Any]]] = None
+    cpu: dict[str, Any]
+    memory: dict[str, Any]
+    disk: dict[str, Any]
+    network: dict[str, Any]
+    gpu: list[dict[str, Any]] | None = None
+    processes: list[dict[str, Any]]
+    system: dict[str, Any]
+    vms: list[dict[str, Any]] | None = None
+    containers: list[dict[str, Any]] | None = None
+    pods: list[dict[str, Any]] | None = None
 
 
 class PingRequest(BaseModel):
@@ -284,7 +290,7 @@ class DNSCheckRequest(BaseModel):
 
 class RemediateRequest(BaseModel):
     action: str = Field(min_length=1, max_length=64)
-    target: Optional[str] = Field(default=None, max_length=128)
+    target: str | None = Field(default=None, max_length=128)
 
 
 class VMActionRequest(BaseModel):
@@ -294,8 +300,8 @@ class VMActionRequest(BaseModel):
 
 class VMResizeRequest(BaseModel):
     """Payload for resizing VM CPU and/or memory."""
-    vcpus: Optional[int] = Field(default=None, ge=1, le=256, description="New number of vCPUs.")
-    memory_mb: Optional[int] = Field(default=None, ge=256, le=1048576, description="New memory in MiB.")
+    vcpus: int | None = Field(default=None, ge=1, le=256, description="New number of vCPUs.")
+    memory_mb: int | None = Field(default=None, ge=256, le=1048576, description="New memory in MiB.")
 
 
 # Approved libvirt domain control actions exposed to the dashboard.
@@ -323,7 +329,7 @@ VM_ACTION_TO_VIRSH = {
 # We only reject leading dashes, which would be parsed as virsh options.
 VM_ID_PATTERN = re.compile(r"^[^-\s][^\x00\n\r]{0,127}$")
 # Bounded in-memory ring buffer of VM control actions for the audit panel.
-_vm_action_log: List[Dict[str, Any]] = []
+_vm_action_log: list[dict[str, Any]] = []
 _VM_ACTION_LOG_LIMIT = 50
 _vm_action_log_lock = asyncio.Lock()
 
@@ -338,7 +344,7 @@ class ConnectionManager:
     """Manages WebSocket connections"""
     
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: list[WebSocket] = []
     
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -365,7 +371,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def get_cpu_stats() -> Dict[str, Any]:
+async def get_cpu_stats() -> dict[str, Any]:
     """Get CPU statistics without blocking interval"""
     cpu_percent = psutil.cpu_percent(interval=None, percpu=True)
     cpu_freq = psutil.cpu_freq()
@@ -388,7 +394,7 @@ async def get_cpu_stats() -> Dict[str, Any]:
     }
 
 
-async def get_memory_stats() -> Dict[str, Any]:
+async def get_memory_stats() -> dict[str, Any]:
     """Get memory statistics"""
     vm = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -408,7 +414,7 @@ async def get_memory_stats() -> Dict[str, Any]:
     }
 
 
-async def get_disk_stats() -> Dict[str, Any]:
+async def get_disk_stats() -> dict[str, Any]:
     """Get disk statistics and transfer rate"""
     global last_disk_io, last_disk_time
     
@@ -464,7 +470,7 @@ async def get_disk_stats() -> Dict[str, Any]:
     }
 
 
-async def get_network_stats() -> Dict[str, Any]:
+async def get_network_stats() -> dict[str, Any]:
     """Get network statistics and transfer rates"""
     global last_net_io, last_net_time
     
@@ -513,7 +519,7 @@ async def get_network_stats() -> Dict[str, Any]:
     }
 
 
-async def get_gpu_stats() -> Optional[List[Dict[str, Any]]]:
+async def get_gpu_stats() -> list[dict[str, Any]] | None:
     """Get GPU statistics using NVML"""
     if not NVML_AVAILABLE:
         return None
@@ -575,7 +581,7 @@ async def get_gpu_stats() -> Optional[List[Dict[str, Any]]]:
     return gpus if gpus else None
 
 
-async def get_process_stats(limit: int = 30) -> List[Dict[str, Any]]:
+async def get_process_stats(limit: int = 30) -> list[dict[str, Any]]:
     """Get processes sorted by resource usage"""
     processes = []
     
@@ -600,7 +606,7 @@ async def get_process_stats(limit: int = 30) -> List[Dict[str, Any]]:
     return processes[:limit]
 
 
-async def get_system_info() -> Dict[str, Any]:
+async def get_system_info() -> dict[str, Any]:
     """Get system information"""
     boot_time = datetime.fromtimestamp(psutil.boot_time())
     uptime = datetime.now() - boot_time
@@ -623,7 +629,7 @@ async def get_system_info() -> Dict[str, Any]:
 # DOCKER CONTAINER & KUBERNETES POD MONITORING
 # =============================================================================
 
-async def get_docker_containers() -> Optional[List[Dict[str, Any]]]:
+async def get_docker_containers() -> list[dict[str, Any]] | None:
     """List all Docker containers on the host using the docker CLI."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -632,7 +638,7 @@ async def get_docker_containers() -> Optional[List[Dict[str, Any]]]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode != 0:
             return None
         containers = []
@@ -665,7 +671,7 @@ async def get_docker_containers() -> Optional[List[Dict[str, Any]]]:
         return None
 
 
-async def get_docker_container_logs(container_id: str, lines: int = 100) -> Optional[str]:
+async def get_docker_container_logs(container_id: str, lines: int = 100) -> str | None:
     """Fetch recent logs from a Docker container."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -681,7 +687,7 @@ async def get_docker_container_logs(container_id: str, lines: int = 100) -> Opti
         return None
 
 
-async def get_docker_container_stats() -> Optional[List[Dict[str, Any]]]:
+async def get_docker_container_stats() -> list[dict[str, Any]] | None:
     """Get live resource usage for running Docker containers."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -690,7 +696,7 @@ async def get_docker_container_stats() -> Optional[List[Dict[str, Any]]]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
             return None
         stats = []
@@ -722,7 +728,7 @@ async def get_docker_container_stats() -> Optional[List[Dict[str, Any]]]:
         return None
 
 
-async def get_kubernetes_pods() -> Optional[List[Dict[str, Any]]]:
+async def get_kubernetes_pods() -> list[dict[str, Any]] | None:
     """List Kubernetes pods if kubectl is available and configured."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -730,7 +736,7 @@ async def get_kubernetes_pods() -> Optional[List[Dict[str, Any]]]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
             return None
         data = json.loads(stdout.decode(errors="replace"))
@@ -932,7 +938,7 @@ async def _resolve_domain(vm_id: str, conn=None):
     return None, f"VM '{vm_id}' was not found."
 
 
-def _virsh_command(action: str, vm_id: str) -> List[str]:
+def _virsh_command(action: str, vm_id: str) -> list[str]:
     """Build the argv for a constrained virsh lifecycle command.
 
     Correctness notes (these were the actual bugs):
@@ -963,7 +969,7 @@ def _virsh_command(action: str, vm_id: str) -> List[str]:
     return [sudo, "-n", *args]
 
 
-async def _run_virsh_action(action: str, vm_id: str) -> Optional[str]:
+async def _run_virsh_action(action: str, vm_id: str) -> str | None:
     """Run a constrained virsh command as the privileged fallback path.
 
     Returns ``None`` on success, or a human-readable error string on failure.
@@ -1008,7 +1014,7 @@ async def _run_virsh_action(action: str, vm_id: str) -> Optional[str]:
     return None
 
 
-def _humanize_vm_error(err: str, action: str, returncode: Optional[int] = None) -> str:
+def _humanize_vm_error(err: str, action: str, returncode: int | None = None) -> str:
     """Translate raw libvirt/sudo failures into actionable operator guidance."""
     low = (err or "").lower()
     if "a password is required" in low or "sudo: a terminal is required" in low:
@@ -1137,7 +1143,7 @@ async def resize_vm(vm_id: str, payload: VMResizeRequest):
 
     # For a running VM we modify live state; for a stopped one we modify the
     # persistent config so the change takes effect on next start.
-    affect_flag = (libvirt.VIR_DOMAIN_AFFECT_LIVE if is_running
+    _affect_flag = (libvirt.VIR_DOMAIN_AFFECT_LIVE if is_running
                    else libvirt.VIR_DOMAIN_AFFECT_CONFIG)
 
     messages = []
@@ -1341,7 +1347,7 @@ async def resize_vm(vm_id: str, payload: VMResizeRequest):
 
 
 @app.post("/api/vms/{vm_id}/{action}")
-async def control_vm(vm_id: str, action: str, payload: Optional[VMActionRequest] = None):
+async def control_vm(vm_id: str, action: str, payload: VMActionRequest | None = None):
     """Perform a libvirt domain action (start, shutdown, poweroff, reboot, ...).
 
     Control is attempted natively through a read-write libvirt connection and
@@ -1456,7 +1462,7 @@ async def control_vm(vm_id: str, action: str, payload: Optional[VMActionRequest]
     }
 
 
-async def _read_domain_state(vm_id: str) -> Optional[str]:
+async def _read_domain_state(vm_id: str) -> str | None:
     """Best-effort read of a domain's current state name after an action."""
     state_names = {
         libvirt.VIR_DOMAIN_NOSTATE: "no_state", libvirt.VIR_DOMAIN_RUNNING: "running",
@@ -1482,7 +1488,7 @@ async def vm_action_log(limit: int = Query(20, ge=1, le=_VM_ACTION_LOG_LIMIT)):
     return {"entries": recent, "total": len(_vm_action_log)}
 
 
-def _build_virsh_modify_command(subcmd: str, vm_id: str, *args) -> List[str]:
+def _build_virsh_modify_command(subcmd: str, vm_id: str, *args) -> list[str]:
     """Build a virsh command for domain modification via the fallback path."""
     base = [VIRSH_BIN, "--quiet", "--connect", LIBVIRT_URI,
             subcmd, vm_id, *args]
@@ -1494,7 +1500,7 @@ def _build_virsh_modify_command(subcmd: str, vm_id: str, *args) -> List[str]:
     return [sudo, "-n", *base]
 
 
-async def _run_virsh_modify(command: List[str]) -> Optional[str]:
+async def _run_virsh_modify(command: list[str]) -> str | None:
     """Run a virsh modify command and return error string or None on success."""
     if not command:
         return "sudo/virsh not available"
@@ -1515,7 +1521,7 @@ async def _run_virsh_modify(command: List[str]) -> Optional[str]:
 
 
 
-async def get_vm_stats() -> Optional[List[Dict[str, Any]]]:
+async def get_vm_stats() -> list[dict[str, Any]] | None:
     """Return libvirt domain inventory and live metrics for running KVM guests.
 
     Libvirt exposes CPU time and I/O counters cumulatively, therefore rates are
@@ -1559,14 +1565,14 @@ async def get_vm_stats() -> Optional[List[Dict[str, Any]]]:
     async with vm_metrics_lock:
         now = time.monotonic()
 
-        vms: List[Dict[str, Any]] = []
+        vms: list[dict[str, Any]] = []
         active_domain_ids = set()
         for domain in domains:
             try:
                 info = domain.info()  # state, maxMem KiB, memory KiB, vCPUs, cpuTime ns
                 state = state_map.get(info[0], "unknown")
                 domain_id = domain.ID() if domain.isActive() else -1
-                vm: Dict[str, Any] = {
+                vm: dict[str, Any] = {
                     "id": domain_id, "uuid": domain.UUIDString(), "name": domain.name(),
                     "state": state, "active": bool(domain.isActive()), "vcpus": info[3],
                     "max_memory": info[1], "memory": info[2], "cpu_time": info[4],
@@ -2238,7 +2244,7 @@ async def troubleshoot_health_check():
             "name": "RAM & Swap Exhaustion",
             "status": "critical",
             "value": f"{mem_pct}% RAM used ({avail_mb:.0f} MB free), {swap_pct}% Swap",
-            "message": f"Memory critically low! Risk of OOM (Out Of Memory) process kills.",
+            "message": "Memory critically low! Risk of OOM (Out Of Memory) process kills.",
             "remediation": "Clear page cache or restart high memory consumers.",
             "action": "clear_pagecache"
         })
@@ -2401,7 +2407,7 @@ async def troubleshoot_health_check():
         if out:
             lines = [l for l in out.split('\n') if l.strip()]
             for l in lines[-100:]:
-                if re.search(r'oom-killer|out of memory|panic|error|failed|corruption', l, re.I):
+                if re.search(r'oom-killer|out of memory|panic|error|failed|corruption', l, re.IGNORECASE):
                     kernel_errors.append(l[:120])
     except Exception:
         pass
@@ -2547,9 +2553,9 @@ async def troubleshoot_logs(
                 continue
             
             log_level = "info"
-            if re.search(r'error|fail|critical|panic|fatal|oom|corrupt', line, re.I):
+            if re.search(r'error|fail|critical|panic|fatal|oom|corrupt', line, re.IGNORECASE):
                 log_level = "error"
-            elif re.search(r'warn|alert|denied|timeout|retry', line, re.I):
+            elif re.search(r'warn|alert|denied|timeout|retry', line, re.IGNORECASE):
                 log_level = "warning"
 
             if level == "all" or level == log_level:
@@ -2639,7 +2645,7 @@ async def troubleshoot_port_check(req: PortCheckRequest):
             "port": port,
             "open": False,
             "latency_ms": None,
-            "message": f"Closed / unreachable: {str(e)}"
+            "message": f"Closed / unreachable: {e!s}"
         }
 
 
@@ -2924,7 +2930,7 @@ async def run_command(request: Request):
         raise HTTPException(status_code=504, detail="Diagnostic command timed out after 15 seconds.")
     except FileNotFoundError:
         raise HTTPException(status_code=501, detail=f"Diagnostic command is unavailable: {args[0]}")
-    except Exception as e:
+    except Exception:
         logger.exception("Diagnostic command failed")
         raise HTTPException(status_code=500, detail="Diagnostic command could not be executed.")
 
