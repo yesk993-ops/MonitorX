@@ -14,6 +14,7 @@ import socket
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as DefusedET
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -1680,7 +1681,7 @@ async def get_vm_stats() -> list[dict[str, Any]] | None:
 
                 disk_read = disk_write = net_rx = net_tx = 0
                 try:
-                    root = ET.fromstring(domain.XMLDesc(0))
+                    root = DefusedET.fromstring(domain.XMLDesc(0))
                     disk_targets = [node.get("dev") for node in root.findall("./devices/disk/target") if node.get("dev")]
                     interface_targets = [node.get("dev") for node in root.findall("./devices/interface/target") if node.get("dev")]
                 except ET.ParseError:
@@ -1977,7 +1978,7 @@ async def vm_console_ws(websocket: WebSocket, vm_id: str):
     # Try VNC console first
     try:
         xml_desc = await _run_libvirt(domain.XMLDesc, timeout=5.0)
-        root = ET.fromstring(xml_desc)
+        root = DefusedET.fromstring(xml_desc)
         graphics = root.find("./devices/graphics[@type='vnc']")
         if graphics is not None:
             vnc_port = int(graphics.get("port", 5900))
