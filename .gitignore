@@ -1,11 +1,6 @@
-__pycache__/
-*.pyc
-.venv/
-.env
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-*.log
-# Local MonitorX operations history and configuration
-monitorx-operations.db
+```
+# Dependencies
+node_modules/
+# Package lock
+package-lock.json
+```
